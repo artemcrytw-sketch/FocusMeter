@@ -1109,26 +1109,27 @@ class IconCache:
     def __init__(self):
         self.mem = {}
 
-    def get(self, app):
+    def get(self, app, compact=False):
         fn = icon_file(app)
         real = os.path.exists(fn)
-        key = (app, real, P.name, K)
+        key = (app, real, P.name, K, compact)
         if key in self.mem:
             return self.mem[key]
-        size = S(44)
+        size = S(24 if compact else 44)
+        background = P.BG if compact else P.CARD
         try:
             if real:
-                isz = S(28)
+                isz = S(22 if compact else 28)
                 ic = Image.open(fn).convert("RGBA").resize((isz, isz), Image.LANCZOS)
-                tile = rr_image(size, size, S(12), P.FILL, P.CARD)
+                tile = rr_image(size, size, S(6 if compact else 12), background if compact else P.FILL, background)
                 tile.paste(ic, ((size - isz) // 2, (size - isz) // 2), ic)
             else:
                 av = make_avatar(app, size)
-                tile = Image.new("RGB", (size, size), P.CARD); tile.paste(av, (0, 0), av)
+                tile = Image.new("RGB", (size, size), background); tile.paste(av, (0, 0), av)
         except Exception:
             log("icon tile: " + traceback.format_exc())
             av = make_avatar(app, size)
-            tile = Image.new("RGB", (size, size), P.CARD); tile.paste(av, (0, 0), av)
+            tile = Image.new("RGB", (size, size), background); tile.paste(av, (0, 0), av)
         ph = ImageTk.PhotoImage(tile)
         self.mem[key] = ph
         return ph
@@ -1806,9 +1807,9 @@ class Dashboard:
         self.apps_days, self.week_days, self.search, self.apps_mode = 1, 7, "", "apps"
         self.wr_period, self.wr_idx, self.wr_slides, self.wr_photo = self.store.get("wr_period", "all"), 0, [], None
         self.wr_stats = {}
-        self._gauge_key = None
+        self.hour_seconds = [0] * 24
 
-        self._sidebar()
+        self._topbar()
         self.content = tk.Frame(self.win, bg=P.BG); self.content.pack(side="left", fill="both", expand=True)
         self.pages = {k: self._safe(f) for k, f in [("today", self._today), ("week", self._week),
                                             ("apps", self._apps), ("wrapped", self._wrapped),
@@ -1853,46 +1854,54 @@ class Dashboard:
             pass
 
     # ---------- каркас
-    def _sidebar(self):
-        sb = tk.Frame(self.win, bg=P.SIDE, width=S(240)); sb.pack(side="left", fill="y"); sb.pack_propagate(False)
-        tk.Frame(self.win, bg=P.LINE, width=1).pack(side="left", fill="y")
-        logo = tk.Frame(sb, bg=P.SIDE); logo.pack(fill="x", padx=S(22), pady=(S(28), S(30)))
-        tk.Label(logo, image=self.logo_small, bg=P.SIDE).pack(side="left")
-        t = tk.Frame(logo, bg=P.SIDE); t.pack(side="left", padx=(S(12), 0))
-        tk.Label(t, text="FocusMeter", bg=P.SIDE, fg=P.TEXT, font=fnt_serif(15)).pack(anchor="w")
-        tk.Label(t, text="твоё время под контролем", bg=P.SIDE, fg=P.MUTED, font=fnt(8)).pack(anchor="w")
+    def _topbar(self):
+        bar = tk.Frame(self.win, bg=P.BG)
+        bar.pack(fill="x", padx=S(32))
+        bar.columnconfigure(1, weight=1)
+        brand = tk.Frame(bar, bg=P.BG)
+        brand.grid(row=0, column=0, sticky="w")
+        tk.Label(brand, image=self.logo_small, bg=P.BG).pack(side="left")
+        tk.Label(brand, text="FocusMeter", font=fnt_serif(16), bg=P.BG, fg=P.TEXT).pack(side="left", padx=S(8))
+        tabs = tk.Frame(bar, bg=P.BG)
+        tabs.grid(row=0, column=1)
         self.nav = {}
-        for key, glyph, text in [("today", "\uE121", "Сегодня"), ("week", "\uE787", "Неделя и месяц"),
-                                 ("apps", "\uE71D", "Приложения"), ("wrapped", "\uE735", "Wrapped"),
-                                 ("settings", "\uE713", "Настройки")]:
-            b = NavItem(sb, glyph, text, lambda k=key: self.show(k)); b.pack(fill="x", padx=S(14), pady=S(2))
-            self.nav[key] = b
-        tk.Frame(sb, bg=P.SIDE).pack(fill="both", expand=True)
-        st = Card(sb, fill=P.FILL, bg=P.SIDE, radius=16, margin=0, shadow=False, fit=True)
-        st.pack(fill="x", padx=S(14), pady=(0, S(18)))
-        b = st.body
-        r = tk.Frame(b, bg=P.FILL); r.pack(fill="x", padx=S(14), pady=(S(12), S(8)))
-        self.dot = tk.Label(r, text="●", bg=P.FILL, font=fnt(11)); self.dot.pack(side="left")
-        self.status = tk.Label(r, text="", bg=P.FILL, fg=P.TEXT, font=fnt(9, True)); self.status.pack(side="left", padx=(S(6), 0))
-        self.pause_btn = Pill(b, "Пауза", "#FFFFFF", P.ACCENT, P.FILL, command=self.app.toggle_pause,
-                              hover=mix(P.ACCENT, "#000000", 0.12), min_w=150, pady=7)
-        self.pause_btn.pack(padx=S(14), pady=(0, S(14)))
-        self.sync_status()
+        for key, name in (("today", "День"), ("week", "Неделя"), ("apps", "Приложения"),
+                          ("wrapped", "Wrapped"), ("settings", "Настройки")):
+            tab = tk.Frame(tabs, bg=P.BG)
+            tab.pack(side="left", padx=S(10))
+            button = tk.Button(tab, text=name, command=lambda k=key: self.show(k),
+                               font=fnt(11), relief="flat", bd=0, bg=P.BG, activebackground=P.BG,
+                               activeforeground=P.TEXT, cursor="hand2")
+            button.pack(pady=(S(15), S(12)))
+            line = tk.Frame(tab, height=S(3), bg=P.BG)
+            line.pack(fill="x")
+            self.nav[key] = (button, line)
+        actions = tk.Frame(bar, bg=P.BG)
+        actions.grid(row=0, column=2)
+        self.dot = tk.Label(actions, text="●", bg=P.BG, font=fnt(9))
+        self.dot.pack(side="left")
+        self.status = tk.Label(actions, bg=P.BG, fg=P.MUTED, font=fnt(10))
+        self.status.pack(side="left")
+        self.pause_button = tk.Button(actions, command=self.app.toggle_pause, font=fnt(10),
+                                     bg=P.FILL, fg=P.TEXT, relief="flat", bd=0, cursor="hand2",
+                                     activebackground=P.LINE, activeforeground=P.TEXT)
+        self.pause_button.pack(side="left", padx=(S(8), 0))
+        tk.Frame(self.win, height=1, bg=P.LINE).pack(fill="x")
 
     def sync_status(self):
-        paused = self.app.tracker.paused
-        idle = self.app.tracker.idle
+        paused, idle = self.app.tracker.paused, self.app.tracker.idle
         self.dot.configure(fg=P.WARN if paused else P.MUTED if idle else P.GREEN)
-        self.status.configure(text="На паузе" if paused else "Нет активности" if idle else "Учёт времени идёт")
-        self.pause_btn.reconfig(text="Продолжить" if paused else "Пауза")
+        self.status.configure(text="На паузе" if paused else "Нет активности" if idle else "Учёт идёт")
+        self.pause_button.configure(text="Продолжить" if paused else "Пауза")
 
     def show(self, name):
         for p in self.pages.values():
             p.pack_forget()
         self.pages[name].pack(fill="both", expand=True)
-        for k, b in self.nav.items():
-            b.set_active(k == name)
-        self.page, self.sig, self._gauge_key = name, {}, None
+        for k, (button, line) in self.nav.items():
+            button.configure(fg=P.TEXT if k == name else P.MUTED)
+            line.configure(bg=P.ACCENT if k == name else P.BG)
+        self.page, self.sig = name, {}
         self.refresh()
 
     def refresh(self):
@@ -1957,73 +1966,144 @@ class Dashboard:
     # ---------- Сегодня
     def _today(self):
         pg = tk.Frame(self.content, bg=P.BG)
-        self._header(pg, "Сегодня", date_title())
-        row = self._stats_row(pg, 3)
-        self.s_total = self._stat(row, 0, "СЕГОДНЯ", "\uE121", P.ACCENT)
-        self.s_streak = self._stat(row, 1, "СЕРИЯ ДНЕЙ", "\uE734", P.WARN)
-        self.s_focus = self._stat(row, 2, "ФОКУС-СКОР", "\uE73E", P.GREEN)
-        main = tk.Frame(pg, bg=P.BG); main.pack(fill="both", expand=True, padx=S(24), pady=(0, S(16)))
-        main.columnconfigure(0, weight=1); main.columnconfigure(1, minsize=S(440)); main.rowconfigure(0, weight=1)
-        left = Card(main); left.grid(row=0, column=0, sticky="nsew")
-        self._title(left.body, "Прогресс дня", "Цель меняется в настройках")
-        self.gauge = tk.Canvas(left.body, bg=P.CARD, highlightthickness=0, bd=0)
-        self.gauge.pack(fill="both", expand=True, padx=S(20), pady=S(6))
-        self.gauge.bind("<Configure>", lambda e: self._draw_gauge(True))
-        self.cat_today = CatBar(left.body, P.CARD); self.cat_today.pack(fill="x", padx=S(24), pady=(0, S(22)))
-        right = Card(main, width=S(440)); right.grid(row=0, column=1, sticky="nsew")
-        self._title(right.body, "Где проходит время", "Только то, где ты был дольше минуты")
-        self.today_list = ScrollFrame(right.body, P.CARD)
-        self.today_list.pack(fill="both", expand=True, padx=S(18), pady=(S(10), S(16)))
+        body = tk.Frame(pg, bg=P.BG)
+        body.place(relx=0.5, rely=0, anchor="n", relheight=1)
+        pg.bind("<Configure>", lambda e: body.configure(width=min(S(860), max(1, e.width - S(64)))))
+        body.pack_propagate(False)
+        summary = tk.Frame(body, bg=P.BG)
+        summary.pack(fill="x", pady=(S(28), S(22)))
+        left = tk.Frame(summary, bg=P.BG)
+        left.pack(side="left")
+        self.journal_date = tk.Label(left, font=fnt(11), bg=P.BG, fg=P.MUTED)
+        self.journal_date.pack(anchor="w")
+        tk.Label(left, text="Журнал дня", font=(SERIF, 32), bg=P.BG, fg=P.TEXT).pack(anchor="w")
+        self.journal_total = tk.Label(left, font=fnt(14), bg=P.BG, fg=P.TEXT)
+        self.journal_total.pack(anchor="w", pady=(S(12), 0))
+        self.journal_goal = tk.Label(left, font=fnt(10), bg=P.BG, fg=P.MUTED)
+        self.journal_goal.pack(anchor="w")
+        self.goal_track = tk.Canvas(left, height=S(4), width=S(275), bg=P.LINE, highlightthickness=0)
+        self.goal_track.pack(anchor="w", pady=(S(6), 0))
+        right = tk.Frame(summary, bg=P.BG)
+        right.pack(side="right", anchor="s")
+        tk.Label(right, text="Минуты за экраном по часам", font=fnt(10), bg=P.BG, fg=P.MUTED).pack(anchor="w")
+        self.hours_chart = tk.Canvas(right, width=S(320), height=S(95), bg=P.BG, highlightthickness=0)
+        self.hours_chart.pack()
+        self.hours_chart.bind("<Configure>", lambda e: self._draw_hours())
+        tk.Frame(body, bg=P.LINE, height=1).pack(fill="x")
+        heading = tk.Frame(body, bg=P.BG)
+        heading.pack(fill="x", pady=(S(13), S(9)))
+        tk.Label(heading, text="По часам", bg=P.BG, fg=P.TEXT, font=fnt(16, True)).pack(side="left")
+        tk.Label(heading, text="Длительность", bg=P.BG, fg=P.MUTED, font=fnt(10)).pack(side="right")
+        self.timeline = ScrollFrame(body, P.BG)
+        self.timeline.pack(fill="both", expand=True, pady=(0, S(12)))
+        self.duration_labels = {}
         return pg
 
-    def _draw_gauge(self, force=False):
-        c = self.gauge
-        w, h = c.winfo_width(), c.winfo_height()
-        if w < 80 or h < 80:
+    def _draw_hours(self):
+        chart = self.hours_chart
+        chart.delete("all")
+        width = chart.winfo_width()
+        if width < 24:
             return
-        val, goal, mode = self.store.goal_today(), self.store.goal_sec(), self.store.goal_mode()
-        d = max(120, min(w, h) - S(8))
-        key = (int(val // 20), goal, d, P.name, mode)
-        if key != self._gauge_key or force:
-            self._gauge_key = key
-            frac = min(1.0, val / goal) if goal else 0
-            over = mode == "limit" and val > goal
-            c1, c2 = (P.DANGER, P.DANGER) if over else (P.ACCENT, P.ACCENT2)
-            sub = f"лимит {goal / 3600:g} ч" if mode == "limit" else f"из {goal / 3600:g} ч работы"
-            self._gauge_ph = ImageTk.PhotoImage(ring_image(d, frac, S(22), c1, c2, P.FILL, P.CARD))
-            c.delete("all")
-            c.create_image(w // 2, h // 2, image=self._gauge_ph)
-            c.create_text(w // 2, h // 2 - S(16), text=fmt(val), fill=P.TEXT, font=fnt_serif(30))
-            c.create_text(w // 2, h // 2 + S(18), text=sub, fill=P.MUTED, font=fnt(11))
-            c.create_text(w // 2, h // 2 + S(46), text=f"{int(frac * 100)}%",
-                          fill=P.DANGER if over else P.ACCENT, font=fnt(15, True))
+        active = [hour for hour, seconds in enumerate(self.hour_seconds) if seconds]
+        if not active:
+            chart.create_text(0, S(42), text="Пока нет почасовых данных", anchor="w",
+                              font=fnt(10), fill=P.MUTED)
+            return
+        hours = range(active[0], active[-1] + 1)
+        left, base, height = S(26), S(69), S(44)
+        step = (width - left) / len(hours)
+        for minutes in (0, 30, 60):
+            y = base - height * minutes / 60
+            chart.create_line(left, y, width, y, fill=P.LINE)
+            chart.create_text(left-S(4), y, text=str(minutes), anchor="e", font=fnt(8), fill=P.MUTED)
+        stride = max(1, int((S(37) + step - 1) // step))
+        for index, hour in enumerate(hours):
+            seconds = self.hour_seconds[hour]
+            x = left + (index + 0.5) * step
+            bar = min(S(26), step * 0.66) / 2
+            if seconds:
+                y = base - max(1, height * min(seconds / 3600, 1))
+                chart.create_rectangle(x-bar, y, x+bar, base, fill=P.ACCENT, outline="")
+                if stride == 1:
+                    chart.create_text(x, y-S(2), text=str(seconds//60) if seconds >= 60 else "<1",
+                                      anchor="s", font=fnt(8), fill=P.TEXT)
+            if index % stride == 0:
+                chart.create_text(x, base+S(4), text=f"{hour:02}:00", anchor="n", font=fnt(8), fill=P.MUTED)
+
     def _r_today(self):
-        total, cats = self.store.total(1), self.store.categories(1)
-        goal, val = self.store.goal_sec(), self.store.goal_today()
-        self.s_total.v.configure(text=fmt(total))
-        y = self.store.total_day(1)
-        pct = f"{int(val / goal * 100)}% от цели" if goal else ""
-        self.s_total.s.configure(text=f"{pct} · вчера {fmt(y)}" if y else (pct or " "))
-        n = self.store.streak()
-        self.s_streak.v.configure(text=f"{n} дн.")
-        self.s_streak.s.configure(text="подряд с выполненной целью")
-        work = cats[CAT_LIST[0]]
-        self.s_focus.v.configure(text=f"{int(work / total * 100)}%" if total else "—")
-        self.s_focus.s.configure(text="доля работы и учёбы")
-        self._draw_gauge()
-        self.cat_today.update_data(cats)
-        apps = self.store.apps(1, 8)
-        if self.sig.get("t") == apps:
+        total = self.store.total_day()
+        goal, value = self.store.goal_sec(), self.store.goal_today()
+        limit = self.store.goal_mode() == "limit"
+        self.journal_date.configure(text=date_title())
+        self.journal_total.configure(text=f"{fmt(total)} за экраном")
+        self.journal_goal.configure(text=f"Лимит · {fmt(goal)}" if limit else f"Работа и учёба · {fmt(value)} из {fmt(goal)}")
+        self.goal_track.delete("all")
+        if goal and value:
+            self.goal_track.create_rectangle(0, 0, S(275) * min(value/goal, 1), S(4), outline="",
+                                             fill=P.DANGER if limit and value > goal else P.ACCENT)
+        rows = self.store.q("SELECT hour, app, seconds FROM hourly_usage WHERE day=? AND seconds>0 "
+                            "ORDER BY hour DESC, seconds DESC, app", (date.today().isoformat(),))
+        hours = [0] * 24
+        entries = []
+        for hour, app, seconds in rows:
+            hours[hour] += seconds
+            if seconds >= MIN_APP_SEC:
+                entries.append((hour, app, self.store.classify(app)))
+        if hours != self.hour_seconds:
+            self.hour_seconds = hours
+            self._draw_hours()
+        signature = (entries, bool(total), bool(rows))
+        if self.sig.get("journal") != signature:
+            self.sig["journal"] = signature
+            self._build_timeline(entries, total)
+        for hour, app, seconds in rows:
+            if seconds >= MIN_APP_SEC:
+                self.duration_labels[hour, app].configure(text=fmt(seconds))
+
+    def _build_timeline(self, entries, total):
+        inner = self.timeline.inner
+        position = self.timeline.cv.yview()[0]
+        self.timeline.clear()
+        self.duration_labels.clear()
+        if not entries:
+            message = "За сегодня сохранился только общий итог." if total else "Здесь появится активность за первый час."
+            if any(self.hour_seconds):
+                message = "Приложение появится здесь, когда за час наберётся минута."
+            tk.Label(inner, text=message, bg=P.BG, fg=P.MUTED, font=fnt(11)).pack(anchor="w", pady=S(18))
             return
-        self.sig["t"] = apps
-        self.today_list.clear()
-        if not apps:
-            tk.Label(self.today_list.inner, text="Пока пусто. Приложение появится здесь,\nкак только ты проведёшь в нём минуту.",
-                     bg=P.CARD, fg=P.MUTED, font=fnt(9), justify="left").pack(pady=S(24), padx=S(8), anchor="w")
-            return
-        mx = apps[0][1] or 1
-        for a, s in apps:
-            self._app_row(self.today_list.inner, a, s / mx, fmt_short(s), f"{int(s / (total or 1) * 100)}% дня")
+        inner.columnconfigure(1, weight=3, uniform="journal")
+        inner.columnconfigure(2, weight=2, uniform="journal")
+        previous = None
+        for i, (hour, app, cat) in enumerate(entries):
+            row = 2 * i + 1
+            first_in_hour = hour != previous
+            if first_in_hour:
+                if i:
+                    tk.Frame(inner, bg=P.LINE, height=1).grid(row=row-1, column=1, columnspan=3,
+                                                              sticky="ew", pady=S(9))
+                tk.Label(inner, text=f"{hour:02}:00", bg=P.BG, fg=P.TEXT, font=fnt(13, True)).grid(
+                    row=row, column=0, padx=(0, S(46)), sticky="w")
+                previous = hour
+            rail = tk.Frame(inner, width=S(12), bg=P.BG)
+            rail.grid(row=row, column=0, sticky="nse", padx=(0, S(14)))
+            tk.Frame(rail, width=1, bg=P.LINE).place(relx=0.5, relheight=1)
+            if first_in_hour:
+                tk.Label(rail, text="●", bg=P.BG, fg=P.MUTED, font=fnt(7)).place(relx=0.5, rely=0.5, anchor="center")
+            name = tk.Frame(inner, bg=P.BG)
+            name.grid(row=row, column=1, sticky="ew", pady=S(4))
+            tk.Label(name, image=self.app.icons.get(app, compact=True), bg=P.BG, bd=0).pack(side="left")
+            tk.Label(name, text=app, bg=P.BG, fg=P.TEXT, font=fnt(12), anchor="w").pack(
+                side="left", padx=S(8), fill="x", expand=True)
+            category = tk.Frame(inner, bg=P.BG)
+            category.grid(row=row, column=2, sticky="w")
+            tk.Label(category, text="●", fg=P.CATS[cat], bg=P.BG, font=fnt(8)).pack(side="left")
+            tk.Label(category, text=cat, fg=P.MUTED, bg=P.BG, font=fnt(10)).pack(side="left", padx=S(5))
+            duration = tk.Label(inner, bg=P.BG, fg=P.TEXT, font=fnt(12), width=11, anchor="e")
+            duration.grid(row=row, column=3, sticky="e")
+            self.duration_labels[hour, app] = duration
+        inner.update_idletasks()
+        self.timeline.cv.yview_moveto(position)
 
     # ---------- Неделя и месяц
     def _week(self):
