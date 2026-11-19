@@ -1957,73 +1957,54 @@ class Dashboard:
     # ---------- Сегодня
     def _today(self):
         pg = tk.Frame(self.content, bg=P.BG)
-        self._header(pg, "Сегодня", date_title())
-        row = self._stats_row(pg, 3)
-        self.s_total = self._stat(row, 0, "СЕГОДНЯ", "\uE121", P.ACCENT)
-        self.s_streak = self._stat(row, 1, "СЕРИЯ ДНЕЙ", "\uE734", P.WARN)
-        self.s_focus = self._stat(row, 2, "ФОКУС-СКОР", "\uE73E", P.GREEN)
-        main = tk.Frame(pg, bg=P.BG); main.pack(fill="both", expand=True, padx=S(24), pady=(0, S(16)))
-        main.columnconfigure(0, weight=1); main.columnconfigure(1, minsize=S(440)); main.rowconfigure(0, weight=1)
-        left = Card(main); left.grid(row=0, column=0, sticky="nsew")
-        self._title(left.body, "Прогресс дня", "Цель меняется в настройках")
-        self.gauge = tk.Canvas(left.body, bg=P.CARD, highlightthickness=0, bd=0)
-        self.gauge.pack(fill="both", expand=True, padx=S(20), pady=S(6))
-        self.gauge.bind("<Configure>", lambda e: self._draw_gauge(True))
-        self.cat_today = CatBar(left.body, P.CARD); self.cat_today.pack(fill="x", padx=S(24), pady=(0, S(22)))
-        right = Card(main, width=S(440)); right.grid(row=0, column=1, sticky="nsew")
-        self._title(right.body, "Где проходит время", "Только то, где ты был дольше минуты")
-        self.today_list = ScrollFrame(right.body, P.CARD)
-        self.today_list.pack(fill="both", expand=True, padx=S(18), pady=(S(10), S(16)))
+        body = tk.Frame(pg, bg=P.BG)
+        body.pack(fill="both", expand=True, padx=S(40), pady=S(24))
+        self.today_date = tk.Label(body, bg=P.BG, fg=P.MUTED, font=fnt(10))
+        self.today_date.pack(anchor="w")
+        self.today_total = tk.Label(body, bg=P.BG, fg=P.TEXT, font=fnt_serif(36))
+        self.today_total.pack(anchor="w")
+        tk.Label(body, text="за экраном сегодня", bg=P.BG, fg=P.MUTED, font=fnt(11)).pack(anchor="w")
+        self.cat_today = CatBar(body, P.BG)
+        self.cat_today.pack(fill="x", pady=S(18))
+        self.today_goal = tk.Label(body, bg=P.BG, fg=P.MUTED, font=fnt(10))
+        self.today_goal.pack(anchor="w")
+        self.goal_bar = Bar(body, 0, P.ACCENT, P.BG)
+        self.goal_bar.pack(fill="x", pady=(S(5), S(20)))
+        heading = tk.Frame(body, bg=P.BG)
+        heading.pack(fill="x")
+        tk.Label(heading, text="Топ приложений", bg=P.BG, fg=P.TEXT, font=fnt(13, True)).pack(side="left")
+        tk.Button(heading, text="Все приложения →", command=lambda: self.show("apps"),
+                  bg=P.BG, fg=P.ACCENT, font=fnt(10), relief="flat", cursor="hand2").pack(side="right")
+        self.today_list = tk.Frame(body, bg=P.BG)
+        self.today_list.pack(fill="x", pady=S(6))
         return pg
 
-    def _draw_gauge(self, force=False):
-        c = self.gauge
-        w, h = c.winfo_width(), c.winfo_height()
-        if w < 80 or h < 80:
-            return
-        val, goal, mode = self.store.goal_today(), self.store.goal_sec(), self.store.goal_mode()
-        d = max(120, min(w, h) - S(8))
-        key = (int(val // 20), goal, d, P.name, mode)
-        if key != self._gauge_key or force:
-            self._gauge_key = key
-            frac = min(1.0, val / goal) if goal else 0
-            over = mode == "limit" and val > goal
-            c1, c2 = (P.DANGER, P.DANGER) if over else (P.ACCENT, P.ACCENT2)
-            sub = f"лимит {goal / 3600:g} ч" if mode == "limit" else f"из {goal / 3600:g} ч работы"
-            self._gauge_ph = ImageTk.PhotoImage(ring_image(d, frac, S(22), c1, c2, P.FILL, P.CARD))
-            c.delete("all")
-            c.create_image(w // 2, h // 2, image=self._gauge_ph)
-            c.create_text(w // 2, h // 2 - S(16), text=fmt(val), fill=P.TEXT, font=fnt_serif(30))
-            c.create_text(w // 2, h // 2 + S(18), text=sub, fill=P.MUTED, font=fnt(11))
-            c.create_text(w // 2, h // 2 + S(46), text=f"{int(frac * 100)}%",
-                          fill=P.DANGER if over else P.ACCENT, font=fnt(15, True))
     def _r_today(self):
-        total, cats = self.store.total(1), self.store.categories(1)
+        self.today_date.configure(text=date_title())
+        self.today_total.configure(text=fmt(self.store.total(1)))
+        self.cat_today.update_data(self.store.categories(1))
         goal, val = self.store.goal_sec(), self.store.goal_today()
-        self.s_total.v.configure(text=fmt(total))
-        y = self.store.total_day(1)
-        pct = f"{int(val / goal * 100)}% от цели" if goal else ""
-        self.s_total.s.configure(text=f"{pct} · вчера {fmt(y)}" if y else (pct or " "))
-        n = self.store.streak()
-        self.s_streak.v.configure(text=f"{n} дн.")
-        self.s_streak.s.configure(text="подряд с выполненной целью")
-        work = cats[CAT_LIST[0]]
-        self.s_focus.v.configure(text=f"{int(work / total * 100)}%" if total else "—")
-        self.s_focus.s.configure(text="доля работы и учёбы")
-        self._draw_gauge()
-        self.cat_today.update_data(cats)
-        apps = self.store.apps(1, 8)
+        limit = self.store.goal_mode() == "limit"
+        label = "Дневной лимит" if limit else "Работа и учёба"
+        self.today_goal.configure(text=f"{label}   {fmt(val)} из {fmt(goal)}")
+        self.goal_bar.ratio = val / goal if goal else 0
+        self.goal_bar.color = P.DANGER if limit and val > goal else P.ACCENT
+        self.goal_bar._draw(self.goal_bar.winfo_width())
+        apps = self.store.apps(1, 3)
         if self.sig.get("t") == apps:
             return
         self.sig["t"] = apps
-        self.today_list.clear()
+        for widget in self.today_list.winfo_children():
+            widget.destroy()
         if not apps:
-            tk.Label(self.today_list.inner, text="Пока пусто. Приложение появится здесь,\nкак только ты проведёшь в нём минуту.",
-                     bg=P.CARD, fg=P.MUTED, font=fnt(9), justify="left").pack(pady=S(24), padx=S(8), anchor="w")
-            return
-        mx = apps[0][1] or 1
-        for a, s in apps:
-            self._app_row(self.today_list.inner, a, s / mx, fmt_short(s), f"{int(s / (total or 1) * 100)}% дня")
+            tk.Label(self.today_list, text="Здесь появятся приложения, в которых ты проведёшь минуту.",
+                     bg=P.BG, fg=P.MUTED, font=fnt(10)).pack(anchor="w", pady=S(8))
+        for name, seconds in apps:
+            row = tk.Frame(self.today_list, bg=P.BG)
+            row.pack(fill="x", pady=S(4))
+            tk.Label(row, image=self.app.icons.get(name), bg=P.BG).pack(side="left")
+            tk.Label(row, text=fmt_short(seconds), bg=P.BG, fg=P.TEXT, font=fnt(11)).pack(side="right")
+            tk.Label(row, text=name, bg=P.BG, fg=P.TEXT, font=fnt(11)).pack(side="left", padx=S(10))
 
     # ---------- Неделя и месяц
     def _week(self):
@@ -2057,7 +2038,7 @@ class Dashboard:
         data = self.store.daily_goal(self.week_days)
         tot = sum(s for _, s in data)
         best = max(data, key=lambda x: x[1])
-        self.w_total.v.configure(text=fmt(tot)); self.w_total.s.configure(text=f"за {self.week_days} дней")
+        self.w_total.v.configure(text=fmt(tot)); self.w_total.s.configure(text=f"Серия дней с целью · {self.store.streak()}")
         first = next((i for i, (_, s) in enumerate(data) if s), len(data) - 1)
         n_days = len(data) - first          # дни с момента первой записи
         self.w_avg.v.configure(text=fmt(tot // n_days))
