@@ -1,4 +1,4 @@
-# FocusMeter 3.2 (+ Wrapped) — трекер экранного времени для Windows
+# FocusMeter 3.3 — трекер экранного времени для Windows
 # Живёт в трее и считает время в фоне; окно открывается по клику и полностью выгружается при закрытии.
 # Нужны: Python 3.10+, pystray, pillow (.bat ставит сам).
 import os, sys, time, csv, re, queue, sqlite3, ctypes, threading, hashlib, math, traceback
@@ -451,10 +451,20 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS blacklist(app TEXT PRIMARY KEY, limit_min INTEGER NOT NULL)")        
         self.db.commit()
         self.buf, self.hbuf = {}, {}
+        self.db.execute("CREATE TABLE IF NOT EXISTS category_rules(pattern TEXT PRIMARY KEY, category TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS hourly_categories(day TEXT,hour INTEGER,app TEXT,category TEXT,"
+                        "seconds INTEGER NOT NULL, PRIMARY KEY(day,hour,app,category))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS usage_categories(day TEXT,app TEXT,title TEXT,category TEXT,"
+                        "seconds INTEGER NOT NULL, PRIMARY KEY(day,app,title,category))")
+        self._load_rules()
         self.cache = dict(self.db.execute("SELECT key, value FROM settings").fetchall())
         self.over = dict(self.db.execute("SELECT app, category FROM apps WHERE category IS NOT NULL").fetchall())
         self.exe = dict(self.db.execute("SELECT app, exe FROM apps WHERE exe IS NOT NULL").fetchall())
         self.bl = dict(self.db.execute("SELECT app, limit_min FROM blacklist").fetchall())
+        if "action" not in {r[1] for r in self.db.execute("PRAGMA table_info(blacklist)")}:
+            self.db.execute("ALTER TABLE blacklist ADD COLUMN action TEXT NOT NULL DEFAULT 'remind'")
+            self.db.commit()
+        self.limit_actions = dict(self.db.execute("SELECT app,action FROM blacklist"))
 
     def get(self, key, default):
         return self.cache.get(key, default)
@@ -474,9 +484,11 @@ class Store:
 
     def add(self, app, title, exe, sec):
         with self.lock:
-            k = (date.today().isoformat(), app, title)
+            now = datetime.now()
+            category = self.classify(app, title)
+            k = (now.date().isoformat(), app, title, category)
             self.buf[k] = self.buf.get(k, 0.0) + sec
-            hk = (k[0], datetime.now().hour, app)
+            hk = (k[0], now.hour, app, category)
             self.hbuf[hk] = self.hbuf.get(hk, 0.0) + sec
             self.exe[app] = exe
 
@@ -495,10 +507,18 @@ class Store:
                 with self.db:
                     self.db.executemany(
                         "INSERT INTO usage(day,app,title,seconds) VALUES(?,?,?,?) "
-                        "ON CONFLICT(day,app,title) DO UPDATE SET seconds=seconds+excluded.seconds", rows)
+                        "ON CONFLICT(day,app,title) DO UPDATE SET seconds=seconds+excluded.seconds",
+                        [(day,app,title,sec) for day,app,title,cat,sec in rows])
+                    self.db.executemany(
+                        "INSERT INTO usage_categories VALUES(?,?,?,?,?) ON CONFLICT(day,app,title,category) "
+                        "DO UPDATE SET seconds=seconds+excluded.seconds", rows)
                     self.db.executemany(
                         "INSERT INTO hourly_usage(day,hour,app,seconds) VALUES(?,?,?,?) "
-                        "ON CONFLICT(day,hour,app) DO UPDATE SET seconds=seconds+excluded.seconds", hrows)
+                        "ON CONFLICT(day,hour,app) DO UPDATE SET seconds=seconds+excluded.seconds",
+                        [(day, hour, app, sec) for day, hour, app, cat, sec in hrows])
+                    self.db.executemany(
+                        "INSERT INTO hourly_categories VALUES(?,?,?,?,?) ON CONFLICT(day,hour,app,category) "
+                        "DO UPDATE SET seconds=seconds+excluded.seconds", hrows)
                     for app in {r[1] for r in rows}:
                         if self.exe.get(app):
                             self.db.execute("INSERT INTO apps(app,exe) VALUES(?,?) "
@@ -513,7 +533,31 @@ class Store:
             self.flush()
             return self.db.execute(sql, args).fetchall()
 
+    def _load_rules(self):
+        self.rules = tuple(self.db.execute("SELECT pattern,category FROM category_rules "
+                                           "ORDER BY length(pattern) DESC, pattern"))
+
+    def set_rule(self, pattern, category):
+        pattern = pattern.strip().casefold()
+        if not pattern or (category is not None and category not in CAT_LIST):
+            raise ValueError("Укажите текст правила и категорию")
+        with self.lock:
+            if category is None:
+                self.db.execute("DELETE FROM category_rules WHERE pattern=?", (pattern,))
+            else:
+                self.db.execute("INSERT INTO category_rules VALUES(?,?) ON CONFLICT(pattern) "
+                                "DO UPDATE SET category=excluded.category", (pattern, category))
+            self.db.commit()
+            self._load_rules()
+
     def classify(self, app, title=""):
+        if self.rules and title:
+            match_text = title.casefold()
+            if app in BROWSERS:
+                match_text += " " + site_of(title).casefold()
+            for pattern, category in self.rules:
+                if pattern in match_text:
+                    return category
         if app in self.over:
             return self.over[app]
         if app in BROWSERS:
@@ -586,29 +630,43 @@ class Store:
         return self.q("SELECT COALESCE(SUM(seconds),0) FROM usage WHERE day=? AND app=?",
                       (date.today().isoformat(), app))[0][0]
 
-    def bl_set(self, app, limit_min):
+    def bl_set(self, app, limit_min, action="remind"):
+        if action not in ("remind", "close"):
+            raise ValueError("Неизвестное действие лимита")
         with self.lock:
-            self.bl[app] = int(limit_min)
-            self.db.execute("INSERT INTO blacklist(app,limit_min) VALUES(?,?) "
-                            "ON CONFLICT(app) DO UPDATE SET limit_min=excluded.limit_min", (app, int(limit_min)))
+            self.db.execute("INSERT INTO blacklist(app,limit_min,action) VALUES(?,?,?) "
+                            "ON CONFLICT(app) DO UPDATE SET limit_min=excluded.limit_min,action=excluded.action",
+                            (app, int(limit_min), action))
             self.db.commit()
+            self.bl[app] = int(limit_min)
+            self.limit_actions[app] = action
 
     def bl_del(self, app):
         with self.lock:
             self.bl.pop(app, None)
+            self.limit_actions.pop(app, None)
             self.db.execute("DELETE FROM blacklist WHERE app=?", (app,))
             self.db.commit()
     def goal_mode(self):
         return self.get("goal_mode", "work")        # "work" = набрать, "limit" = не больше
+
+    def categorized_usage(self, since, until=None):
+        until = until or date.today().isoformat()
+        with self.lock:
+            captured = self.q("SELECT day,app,title,category,seconds FROM usage_categories WHERE day BETWEEN ? AND ?",
+                              (since, until))
+            legacy = self.q("SELECT u.day,u.app,u.title,u.seconds-COALESCE(SUM(c.seconds),0) AS remaining "
+                            "FROM usage u LEFT JOIN usage_categories c USING(day,app,title) WHERE u.day BETWEEN ? AND ? "
+                            "GROUP BY u.day,u.app,u.title HAVING remaining>0", (since, until))
+        return captured + [(d,a,t,self.classify(a,t),s) for d,a,t,s in legacy]
 
     def daily_goal(self, days=7):
         """[(дата, секунды)] по метрике цели: время работы/учёбы или всё экранное время"""
         if self.goal_mode() == "limit":
             return self.daily(days)
         rows = {}
-        for day, app, title, s in self.q("SELECT day, app, title, seconds FROM usage WHERE day>=?",
-                                         (self._since(days),)):
-            if self.classify(app, title) == W_:
+        for day, app, title, category, s in self.categorized_usage(self._since(days)):
+            if category == W_:
                 rows[day] = rows.get(day, 0) + s
         return [(date.today() - timedelta(days=i), rows.get((date.today() - timedelta(days=i)).isoformat(), 0))
                 for i in range(days - 1, -1, -1)]
@@ -617,9 +675,8 @@ class Store:
         return self.daily_goal(1)[0][1]
     def categories(self, days=1):
         res = {c: 0 for c in CAT_LIST}
-        for app, title, s in self.q("SELECT app, title, SUM(seconds) FROM usage WHERE day>=? "
-                                    "GROUP BY app, title", (self._since(days),)):
-            res[self.classify(app, title)] += s
+        for day, app, title, category, s in self.categorized_usage(self._since(days)):
+            res[category] += s
         return res
 
     def streak(self):
@@ -647,9 +704,13 @@ class Store:
                 d = date.today().isoformat()
                 self.db.execute("DELETE FROM usage WHERE day=?", (d,))
                 self.db.execute("DELETE FROM hourly_usage WHERE day=?", (d,))
+                self.db.execute("DELETE FROM hourly_categories WHERE day=?", (d,))
+                self.db.execute("DELETE FROM usage_categories WHERE day=?", (d,))
             else:
                 self.db.execute("DELETE FROM usage")
                 self.db.execute("DELETE FROM hourly_usage")
+                self.db.execute("DELETE FROM hourly_categories")
+                self.db.execute("DELETE FROM usage_categories")
             self.db.commit()
     def compact(self):
         """Старые заголовки окон -> только сайт (браузер) или пусто. Секунды сохраняются."""
@@ -661,6 +722,12 @@ class Store:
                                    "WHERE day<? AND title<>''", (cutoff,)).fetchall()
             if not rows:
                 return
+            details = self.db.execute("SELECT day,app,title,category,seconds FROM usage_categories "
+                                      "WHERE day<? AND title<>''", (cutoff,)).fetchall()
+            self.db.execute("DELETE FROM usage_categories WHERE day<? AND title<>''", (cutoff,))
+            self.db.executemany("INSERT INTO usage_categories VALUES(?,?,?,?,?) ON CONFLICT(day,app,title,category) "
+                                "DO UPDATE SET seconds=seconds+excluded.seconds",
+                                [(d,a,site_of(t) if a in BROWSERS else "",c,s) for d,a,t,c,s in details])
             self.db.executemany("DELETE FROM usage WHERE day=? AND app=? AND title=?",
                                 [(d, a, t) for d, a, t, _ in rows])
             merged = {}
@@ -779,8 +846,9 @@ class Tracker(threading.Thread):
         for app, lim_min in list(bl.items()):
             try:
                 st = self.bl_state.get(app)
-                if not st or st["day"] != today:
-                    st = self.bl_state[app] = {"day": today, "warned": False, "expired": None,
+                policy = (self.store.limit_actions.get(app, "remind"), lim_min)
+                if not st or st["day"] != today or st["policy"] != policy:
+                    st = self.bl_state[app] = {"day": today, "policy": policy, "warned": False, "expired": None,
                                                "closing": None, "pids": [], "closed_once": False}
                 limit = lim_min * 60
                 used = self.store.app_today(app)
@@ -788,6 +856,11 @@ class Tracker(threading.Thread):
                     st["warned"] = True
                     self.notify("Скоро лимит", f"{app}: осталось {fmt(limit - used)} из {lim_min} мин в день.")
                 if used < limit:
+                    continue
+                if policy[0] == "remind":
+                    if st["expired"] is None:
+                        st["expired"] = now
+                        self.notify("Дневной лимит", f"{app}: прошло {lim_min} мин.")
                     continue
                 if st["closing"]:                          # мягкое закрытие уже отправлено
                     if now - st["closing"] >= HARD_AFTER:
@@ -842,8 +915,8 @@ WD_FULL = ["понедельник", "вторник", "среда", "четве
 MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
           "сентября", "октября", "ноября", "декабря"]
 
-def date_title():
-    d = date.today()
+def date_title(d=None):
+    d = d or date.today()
     return f"{WD_FULL[d.weekday()].capitalize()}, {d.day} {MONTHS[d.month - 1]}"
 
 def get_autostart():
@@ -867,8 +940,8 @@ def set_autostart(on):
                 exe = sys.executable
                 if exe.lower().endswith("python.exe"):
                     exe = exe[:-10] + "pythonw.exe"
-                winreg.SetValueEx(k, "FocusMeter", 0, winreg.REG_SZ,
-                                  f'"{exe}" "{os.path.abspath(__file__)}" --background')
+                target = f'"{exe}"' if getattr(sys, "frozen", False) else f'"{exe}" "{os.path.abspath(__file__)}"'
+                winreg.SetValueEx(k, "FocusMeter", 0, winreg.REG_SZ, target + " --background")
             else:
                 try: winreg.DeleteValue(k, "FocusMeter")
                 except FileNotFoundError: pass
@@ -1451,8 +1524,8 @@ def wrapped_stats(store, since):
 
     # приложения, сайты, категории
     cats = {c: 0 for c in CAT_LIST}
-    for app, title, s in store.q("SELECT app, title, SUM(seconds) FROM usage WHERE day>=? GROUP BY app, title", (since,)):
-        cats[store.classify(app, title)] += s
+    for day, app, title, category, s in store.categorized_usage(since):
+        cats[category] += s
     st["cats"] = cats
     st["apps"] = store.q("SELECT app, SUM(seconds) s FROM usage WHERE day>=? GROUP BY app HAVING s>=? "
                          "ORDER BY s DESC LIMIT 5", (since, MIN_APP_SEC))
@@ -1808,6 +1881,7 @@ class Dashboard:
         self.wr_period, self.wr_idx, self.wr_slides, self.wr_photo = self.store.get("wr_period", "all"), 0, [], None
         self.wr_stats = {}
         self.hour_seconds = [0] * 24
+        self.journal_day = None
 
         self._topbar()
         self.content = tk.Frame(self.win, bg=P.BG); self.content.pack(side="left", fill="both", expand=True)
@@ -1974,8 +2048,16 @@ class Dashboard:
         summary.pack(fill="x", pady=(S(28), S(22)))
         left = tk.Frame(summary, bg=P.BG)
         left.pack(side="left")
-        self.journal_date = tk.Label(left, font=fnt(11), bg=P.BG, fg=P.MUTED)
-        self.journal_date.pack(anchor="w")
+        dates = tk.Frame(left, bg=P.BG)
+        dates.pack(anchor="w")
+        tk.Button(dates, text="‹", command=lambda: self._shift_day(-1), bg=P.BG, relief="flat", fg=P.TEXT).pack(side="left")
+        self.journal_date = tk.Label(dates, font=fnt(11), bg=P.BG, fg=P.MUTED)
+        self.journal_date.pack(side="left")
+        self.next_day = tk.Button(dates, text="›", command=lambda: self._shift_day(1), bg=P.BG, relief="flat", fg=P.TEXT)
+        self.next_day.pack(side="left")
+        self.back_today = tk.Button(dates, text="Сегодня", command=lambda: self._open_day(date.today()),
+                                    bg=P.BG, relief="flat", fg=P.ACCENT)
+        self.back_today.pack(side="left")
         tk.Label(left, text="Журнал дня", font=(SERIF, 32), bg=P.BG, fg=P.TEXT).pack(anchor="w")
         self.journal_total = tk.Label(left, font=fnt(14), bg=P.BG, fg=P.TEXT)
         self.journal_total.pack(anchor="w", pady=(S(12), 0))
@@ -2031,11 +2113,24 @@ class Dashboard:
             if index % stride == 0:
                 chart.create_text(x, base+S(4), text=f"{hour:02}:00", anchor="n", font=fnt(8), fill=P.MUTED)
 
+    def _open_day(self, day):
+        self.journal_day = day if day < date.today() else None
+        self.show("today")
+        self.timeline.cv.yview_moveto(0)
+
+    def _shift_day(self, delta):
+        self._open_day((self.journal_day or date.today()) + timedelta(days=delta))
+
     def _r_today(self):
-        total = self.store.total_day()
-        goal, value = self.store.goal_sec(), self.store.goal_today()
+        day = self.journal_day or date.today()
+        total = self.store.total_day((date.today() - day).days)
+        goal = self.store.goal_sec()
         limit = self.store.goal_mode() == "limit"
-        self.journal_date.configure(text=date_title())
+        value = total if limit else sum(sec for _, _, _, cat, sec in
+                                        self.store.categorized_usage(day.isoformat(), day.isoformat()) if cat == W_)
+        self.journal_date.configure(text=date_title(day))
+        self.next_day.configure(state="normal" if self.journal_day else "disabled")
+        self.back_today.configure(state="normal" if self.journal_day else "disabled")
         self.journal_total.configure(text=f"{fmt(total)} за экраном")
         self.journal_goal.configure(text=f"Лимит · {fmt(goal)}" if limit else f"Работа и учёба · {fmt(value)} из {fmt(goal)}")
         self.goal_track.delete("all")
@@ -2043,13 +2138,24 @@ class Dashboard:
             self.goal_track.create_rectangle(0, 0, S(275) * min(value/goal, 1), S(4), outline="",
                                              fill=P.DANGER if limit and value > goal else P.ACCENT)
         rows = self.store.q("SELECT hour, app, seconds FROM hourly_usage WHERE day=? AND seconds>0 "
-                            "ORDER BY hour DESC, seconds DESC, app", (date.today().isoformat(),))
+                            "ORDER BY hour DESC, seconds DESC, app", (day.isoformat(),))
         hours = [0] * 24
+        detail = {}
+        for h, name, category, sec in self.store.q(
+                "SELECT hour,app,category,seconds FROM hourly_categories WHERE day=? ORDER BY seconds DESC,category",
+                (day.isoformat(),)):
+            detail.setdefault((h, name), {})[category] = sec
         entries = []
         for hour, app, seconds in rows:
             hours[hour] += seconds
             if seconds >= MIN_APP_SEC:
-                entries.append((hour, app, self.store.classify(app)))
+                parts = detail.get((hour, app), {})
+                remainder = seconds - sum(parts.values())
+                if remainder > 0:
+                    fallback = self.store.classify(app)
+                    parts[fallback] = parts.get(fallback, 0) + remainder
+                categories = tuple((c, fmt_short(s) if len(parts) > 1 else "") for c, s in parts.items())
+                entries.append((hour, app, categories))
         if hours != self.hour_seconds:
             self.hour_seconds = hours
             self._draw_hours()
@@ -2067,7 +2173,7 @@ class Dashboard:
         self.timeline.clear()
         self.duration_labels.clear()
         if not entries:
-            message = "За сегодня сохранился только общий итог." if total else "Здесь появится активность за первый час."
+            message = "За этот день сохранился только общий итог." if total else "За этот день пока нет записей."
             if any(self.hour_seconds):
                 message = "Приложение появится здесь, когда за час наберётся минута."
             tk.Label(inner, text=message, bg=P.BG, fg=P.MUTED, font=fnt(11)).pack(anchor="w", pady=S(18))
@@ -2075,7 +2181,7 @@ class Dashboard:
         inner.columnconfigure(1, weight=3, uniform="journal")
         inner.columnconfigure(2, weight=2, uniform="journal")
         previous = None
-        for i, (hour, app, cat) in enumerate(entries):
+        for i, (hour, app, categories) in enumerate(entries):
             row = 2 * i + 1
             first_in_hour = hour != previous
             if first_in_hour:
@@ -2097,8 +2203,10 @@ class Dashboard:
                 side="left", padx=S(8), fill="x", expand=True)
             category = tk.Frame(inner, bg=P.BG)
             category.grid(row=row, column=2, sticky="w")
-            tk.Label(category, text="●", fg=P.CATS[cat], bg=P.BG, font=fnt(8)).pack(side="left")
-            tk.Label(category, text=cat, fg=P.MUTED, bg=P.BG, font=fnt(10)).pack(side="left", padx=S(5))
+            for j, (cat, duration_text) in enumerate(categories):
+                tk.Label(category, text="●", fg=P.CATS[cat], bg=P.BG, font=fnt(8)).grid(row=j, column=0)
+                tk.Label(category, text=f"{cat} {duration_text}".rstrip(), fg=P.MUTED, bg=P.BG,
+                         font=fnt(10)).grid(row=j, column=1, sticky="w", padx=S(5))
             duration = tk.Label(inner, bg=P.BG, fg=P.TEXT, font=fnt(12), width=11, anchor="e")
             duration.grid(row=row, column=3, sticky="e")
             self.duration_labels[hour, app] = duration
@@ -2125,6 +2233,7 @@ class Dashboard:
         self.chart.bind("<Configure>", lambda e: self._draw_chart())
         self._hits = []
         self.chart.bind("<Motion>", self._tip)
+        self.chart.bind("<Button-1>", self._chart_day)
         self.chart.bind("<Leave>", lambda e: self.chart.delete("tip"))
         self.cat_week = CatBar(card.body, P.CARD); self.cat_week.pack(fill="x", padx=S(24), pady=(0, S(22)))
         return pg
@@ -2214,6 +2323,17 @@ class Dashboard:
                 c.create_image(x, y, anchor="nw", image=rr_photo(tw, th, th // 2, P.ACCENT, P.CARD), tags="tip")
                 c.create_text(x + tw // 2, y + th // 2, text=text, fill="#FFFFFF", font=fnt(9, True), tags="tip")
                 break
+
+    def _chart_day(self, event):
+        heat = self.store.get("chart_style", "line") == "heat"
+        if heat and self.week_days != 7:
+            return  # В этом режиме ячейка объединяет несколько дат.
+        for index, (x0, y0, x1, y1, _) in enumerate(self._hits):
+            if x0 <= event.x < x1 and y0 <= event.y < y1:
+                today = date.today()
+                offset = (today.weekday() - index // 24) % 7 if heat else self.week_days - 1 - index
+                self._open_day(today - timedelta(days=offset))
+                return
             
     # ---------- Приложения
     def _apps(self):
@@ -2489,10 +2609,24 @@ class Dashboard:
                 lambda v: f"{v} мин", lambda v: s.set("ent_min", v)).pack()
         end(b)
 
-        b = card("Чёрный список", "Дневной лимит · предупреждение за 15 мин · 2 мин на сохранение · затем закрытие")
+        b = card("Лимиты приложений", "По умолчанию — напоминание. Режим закрытия может завершить программу с несохранёнными документами.")
         self._bl_form(b)
         self.bl_box = tk.Frame(b, bg=P.CARD); self.bl_box.pack(fill="x", padx=S(22), pady=(0, S(10)))
         self._bl_render()
+
+        b = card("Правила категорий", "Введите часть заголовка окна или название сайта. При совпадении действует самое длинное правило.")
+        form = tk.Frame(b, bg=P.CARD)
+        form.pack(fill="x", padx=S(22), pady=S(6))
+        self.rule_text = tk.StringVar()
+        self.rule_category = tk.StringVar(value=CAT_LIST[0])
+        field = tk.Entry(form, textvariable=self.rule_text, bg=P.FILL, fg=P.TEXT, font=fnt(11))
+        field.pack(side="left", fill="x", expand=True)
+        tk.OptionMenu(form, self.rule_category, *CAT_LIST).pack(side="left", padx=S(8))
+        Pill(form, "Сохранить", "#FFFFFF", P.ACCENT, P.CARD, command=self._save_rule).pack(side="left")
+        field.bind("<Return>", lambda e: self._save_rule())
+        self.rule_box = tk.Frame(b, bg=P.CARD)
+        self.rule_box.pack(fill="x", padx=S(22), pady=S(6))
+        self._render_rules()
 
         b = card("Данные", "Только на этом ПК")
         Stepper(row(b, "Хранить заголовки окон", "Старше останется только сайт или программа"), P.CARD,
@@ -2506,6 +2640,27 @@ class Dashboard:
                  P.CARD, command=cmd).pack(side="left", padx=(0, S(8)))
         tk.Frame(body, bg=P.BG, height=S(16)).pack()
         return pg
+    def _save_rule(self):
+        pattern = self.rule_text.get().strip()
+        if pattern:
+            self.store.set_rule(pattern, self.rule_category.get())
+            self.rule_text.set("")
+            self._render_rules()
+
+    def _remove_rule(self, pattern):
+        self.store.set_rule(pattern, None)
+        self._render_rules()
+
+    def _render_rules(self):
+        for child in self.rule_box.winfo_children():
+            child.destroy()
+        for pattern, category in self.store.rules:
+            row = tk.Frame(self.rule_box, bg=P.CARD)
+            row.pack(fill="x")
+            tk.Label(row, text=f"{pattern}  →  {category}", bg=P.CARD, fg=P.TEXT, font=fnt(10)).pack(side="left")
+            tk.Button(row, text="Убрать", command=lambda p=pattern: self._remove_rule(p),
+                      bg=P.CARD, fg=P.MUTED, relief="flat").pack(side="right")
+
     def _set_theme(self, name):
         self.store.set("theme", name)
         self.root.after(30, self.app.reopen)
@@ -2597,6 +2752,9 @@ class Dashboard:
             tk.Label(t, text=app, bg=P.CARD, fg=P.TEXT, font=fnt(10, True)).pack(anchor="w")
             tk.Label(t, text=f"лимит {lim} мин · сегодня {fmt(self.store.app_today(app))}",
                      bg=P.CARD, fg=P.MUTED, font=fnt(9)).pack(anchor="w")
+            Seg(r, P.CARD, [("remind", "Только напомнить"), ("close", "Закрыть приложение")],
+                self.store.limit_actions.get(app, "remind"),
+                lambda action, a=app, minutes=lim: self.store.bl_set(a, minutes, action)).pack(side="left", padx=S(12))
             Pill(r, "Убрать", P.DANGER, mix(P.DANGER, P.CARD, 0.88), P.CARD, size=8, pady=4,
                  command=lambda a=app: (self.store.bl_del(a), self._bl_render())).pack(side="right")
 
@@ -2615,8 +2773,8 @@ class Dashboard:
         try:
             with open(path, "w", encoding="utf-8-sig", newline="") as f:
                 w = csv.writer(f); w.writerow(["Дата", "Приложение", "Окно", "Категория", "Секунды"])
-                for d, a, t, s in self.store.q("SELECT day,app,title,seconds FROM usage ORDER BY day DESC, seconds DESC"):
-                    w.writerow([csv_text(d), csv_text(a), csv_text(t), csv_text(self.store.classify(a, t)), s])
+                for d, a, t, cat, s in sorted(self.store.categorized_usage(""), key=lambda r: (r[0], r[4]), reverse=True):
+                    w.writerow([csv_text(d), csv_text(a), csv_text(t), csv_text(cat), s])
             messagebox.showinfo("Экспорт", f"Сохранено:\n{path}")
         except OSError as e:
             messagebox.showerror("Ошибка", str(e))
@@ -2719,6 +2877,30 @@ def already_running():
 
 
 def main():
+    if "--self-test" in sys.argv:
+        import tempfile
+        import pystray
+        from types import SimpleNamespace
+        global APP_DIR, ICON_DIR, DB_PATH, LOG_PATH
+        with tempfile.TemporaryDirectory() as APP_DIR:
+            ICON_DIR = os.path.join(APP_DIR, "icons")
+            DB_PATH = os.path.join(APP_DIR, "test.db")
+            LOG_PATH = os.path.join(APP_DIR, "error.log")
+            root = tk.Tk()
+            root.withdraw()
+            store = Store()
+            store.add("FocusMeter", "test", "", 60)
+            app = SimpleNamespace(root=root, store=store, icons=IconCache(), ico_path=None,
+                                  logo_tk=ImageTk.PhotoImage(make_logo()), tracker=SimpleNamespace(paused=False, idle=False),
+                                  toggle_pause=lambda: None)
+            dashboard = Dashboard(app)
+            root.update()
+            if not dashboard.duration_labels or os.path.exists(LOG_PATH):
+                raise RuntimeError("Dashboard self-test failed")
+            dashboard.close()
+            root.destroy()
+            store.db.close()
+        return
     try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception: pass
     try: shell32.SetCurrentProcessExplicitAppUserModelID("FocusMeter.App")
@@ -2746,6 +2928,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
+        if "--self-test" in sys.argv:
+            raise
         err = traceback.format_exc()
         log("fatal: " + err)
         try:

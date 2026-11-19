@@ -1,0 +1,44 @@
+name: Windows release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - run: python -m pip install pillow pystray pyinstaller
+      - run: python tests/test_storage.py
+      - run: python tests/test_journal.py
+      - run: python tests/test_rules_limits.py
+      - run: ./build_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/FocusMeter-Windows-x64.zip
+  verify-and-publish:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+      - name: Open packaged app without Python on PATH
+        timeout-minutes: 3
+        run: |
+          Expand-Archive FocusMeter-Windows-x64.zip app
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          $p = Start-Process ./app/FocusMeter.exe -ArgumentList '--self-test' -Wait -PassThru
+          exit $p.ExitCode
+      - name: Publish tested archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$env:GITHUB_REF_NAME" FocusMeter-Windows-x64.zip --repo "$env:GITHUB_REPOSITORY" --verify-tag --title "FocusMeter $env:GITHUB_REF_NAME для Windows" --notes "Скачайте ZIP, распакуйте и запустите FocusMeter.exe. В выпуске доступны журнал прошлых дней, два режима лимитов и правила категорий."

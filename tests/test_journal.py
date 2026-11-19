@@ -40,6 +40,19 @@ with tempfile.TemporaryDirectory() as folder:
         for key in ("wrapped","settings","today"):
             dash.nav[key][0].invoke()
             assert dash.page == key
+        yesterday = m["date"].today() - m["timedelta"](days=1)
+        store.db.execute("INSERT INTO usage VALUES(?,?,?,?)",(yesterday.isoformat(),"Past","",180))
+        store.db.execute("INSERT INTO hourly_usage VALUES(?,?,?,?)",(yesterday.isoformat(),9,"Past",180))
+        store.db.commit()
+        dash.show("week")
+        root.update()
+        x0,y0,x1,y1,_ = dash._hits[-2]
+        dash._chart_day(SimpleNamespace(x=(x0+x1)/2,y=(y0+y1)/2))
+        assert dash.page == "today" and dash.journal_day == yesterday
+        assert list(dash.duration_labels) == [(9,"Past")]
+        dash._shift_day(1)
+        assert dash.journal_day is None and str(dash.next_day["state"]) == "disabled"
+        store.db.execute("DELETE FROM hourly_categories")
         store.db.execute("DELETE FROM hourly_usage")
         store.db.commit()
         dash.refresh()
